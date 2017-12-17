@@ -39,15 +39,13 @@ type RequestCounterURLLabelMappingFn func(c *gin.Context) string
 
 // Prometheus contains the metrics gathered by the instance and its path
 type Prometheus struct {
-	reqCnt               *prometheus.CounterVec
-	reqDur, reqSz, resSz prometheus.Summary
-	router               *gin.Engine
-	listenAddress        string
-
-	Ppg PrometheusPushGateway
-
-	MetricsPath string
-
+	reqCnt                  *prometheus.CounterVec
+	reqDur, reqSz, resSz    *prometheus.SummaryVec
+	router                  *gin.Engine
+	listenAddress           string
+	PathMap                 map[string]string
+	Ppg                     PrometheusPushGateway
+	MetricsPath             string
 	ReqCntURLLabelMappingFn RequestCounterURLLabelMappingFn
 }
 
@@ -77,6 +75,7 @@ func NewPrometheus(subsystem string) *Prometheus {
 		ReqCntURLLabelMappingFn: func(c *gin.Context) string {
 			return c.Request.URL.String() // i.e. by default do nothing, i.e. return URL as is
 		},
+		PathMap: make(map[string]string),
 	}
 	p.registerMetrics(subsystem)
 
@@ -185,12 +184,13 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 		log.Info("reqCnt registered.")
 	}
 
-	p.reqDur = prometheus.NewSummary(
+	p.reqDur = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Subsystem: subsystem,
 			Name:      "request_duration_seconds",
 			Help:      "The HTTP request latencies in seconds.",
 		},
+		[]string{"code", "method", "handler", "host", "url"},
 	)
 
 	if err := prometheus.Register(p.reqDur); err != nil {
@@ -199,12 +199,13 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 		log.Info("reqDur registered.")
 	}
 
-	p.reqSz = prometheus.NewSummary(
+	p.reqSz = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Subsystem: subsystem,
 			Name:      "request_size_bytes",
 			Help:      "The HTTP request sizes in bytes.",
 		},
+		[]string{"code", "method", "handler", "host", "url"},
 	)
 
 	if err := prometheus.Register(p.reqSz); err != nil {
@@ -213,12 +214,13 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 		log.Info("reqSz registered.")
 	}
 
-	p.resSz = prometheus.NewSummary(
+	p.resSz = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Subsystem: subsystem,
 			Name:      "response_size_bytes",
 			Help:      "The HTTP response sizes in bytes.",
 		},
+		[]string{"code", "method", "handler", "host", "url"},
 	)
 
 	if err := prometheus.Register(p.resSz); err != nil {
@@ -232,6 +234,7 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 // Use adds the middleware to a gin engine.
 func (p *Prometheus) Use(e *gin.Engine) {
 	e.Use(p.handlerFunc())
+	p.router = e
 	p.setMetricsPath(e)
 }
 
@@ -243,6 +246,7 @@ func (p *Prometheus) UseWithAuth(e *gin.Engine, accounts gin.Accounts) {
 
 func (p *Prometheus) handlerFunc() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		var path string
 		if c.Request.URL.String() == p.MetricsPath {
 			c.Next()
 			return
@@ -251,17 +255,28 @@ func (p *Prometheus) handlerFunc() gin.HandlerFunc {
 		start := time.Now()
 		reqSz := computeApproximateRequestSize(c.Request)
 
+		if in, ok := p.PathMap[c.HandlerName()]; ok {
+			path = in
+		} else {
+			// We miss some routes so let's parse that again
+			for _, ri := range p.router.Routes() {
+				p.PathMap[ri.Handler] = ri.Path
+			}
+			if in, ok := p.PathMap[c.HandlerName()]; ok {
+				path = in
+			} // If we don't know the path here, then we'll never have it
+		}
+
 		c.Next()
 
 		status := strconv.Itoa(c.Writer.Status())
 		elapsed := float64(time.Since(start)) / float64(time.Second)
 		resSz := float64(c.Writer.Size())
 
-		p.reqDur.Observe(elapsed)
-		url := p.ReqCntURLLabelMappingFn(c)
-		p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Inc()
-		p.reqSz.Observe(float64(reqSz))
-		p.resSz.Observe(resSz)
+		p.reqDur.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, path).Observe(elapsed)
+		p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, path).Inc()
+		p.reqSz.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, path).Observe(float64(reqSz))
+		p.resSz.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, path).Observe(resSz)
 	}
 }
 
