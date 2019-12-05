@@ -2,10 +2,12 @@ package ginprometheus
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -30,19 +32,22 @@ var reqDur = &Metric{
 	ID:          "reqDur",
 	Name:        "request_duration_seconds",
 	Description: "The HTTP request latencies in seconds.",
-	Type:        "summary"}
+	Type:        "summary_vec",
+	Args:        []string{"code", "method", "handler", "host", "url"}}
 
 var resSz = &Metric{
 	ID:          "resSz",
 	Name:        "response_size_bytes",
 	Description: "The HTTP response sizes in bytes.",
-	Type:        "summary"}
+	Type:        "summary_vec",
+	Args:        []string{"code", "method", "handler", "host", "url"}}
 
 var reqSz = &Metric{
 	ID:          "reqSz",
 	Name:        "request_size_bytes",
 	Description: "The HTTP request sizes in bytes.",
-	Type:        "summary"}
+	Type:        "summary_vec",
+	Args:        []string{"code", "method", "handler", "host", "url"}}
 
 var standardMetrics = []*Metric{
 	reqCnt,
@@ -86,7 +91,7 @@ type Metric struct {
 // Prometheus contains the metrics gathered by the instance and its path
 type Prometheus struct {
 	reqCnt               *prometheus.CounterVec
-	reqDur, reqSz, resSz prometheus.Summary
+	reqDur, reqSz, resSz *prometheus.SummaryVec
 	router               *gin.Engine
 	listenAddress        string
 	Ppg                  PrometheusPushGateway
@@ -137,7 +142,13 @@ func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus
 		MetricsList: metricsList,
 		MetricsPath: defaultMetricPath,
 		ReqCntURLLabelMappingFn: func(c *gin.Context) string {
-			return c.Request.URL.Path // i.e. by default do nothing, i.e. return URL as is
+
+			// by default use url param names and not values, in order to preserve low cardinality of metrics dimensions
+			url := c.Request.URL.Path
+			for _, p := range c.Params {
+				url = strings.Replace(url, p.Value, fmt.Sprintf(":%s", p.Key), 1)
+			}
+			return url
 		},
 	}
 
@@ -328,11 +339,11 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 		case reqCnt:
 			p.reqCnt = metric.(*prometheus.CounterVec)
 		case reqDur:
-			p.reqDur = metric.(prometheus.Summary)
+			p.reqDur = metric.(*prometheus.SummaryVec)
 		case resSz:
-			p.resSz = metric.(prometheus.Summary)
+			p.resSz = metric.(*prometheus.SummaryVec)
 		case reqSz:
-			p.reqSz = metric.(prometheus.Summary)
+			p.reqSz = metric.(*prometheus.SummaryVec)
 		}
 		metricDef.MetricCollector = metric
 	}
@@ -367,7 +378,6 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 		elapsed := float64(time.Since(start)) / float64(time.Second)
 		resSz := float64(c.Writer.Size())
 
-		p.reqDur.Observe(elapsed)
 		url := p.ReqCntURLLabelMappingFn(c)
 		// jlambert Oct 2018 - sidecar specific mod
 		if len(p.URLLabelFromContext) > 0 {
@@ -377,9 +387,11 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 			}
 			url = u.(string)
 		}
+
+		p.reqDur.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Observe(elapsed)
 		p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Inc()
-		p.reqSz.Observe(float64(reqSz))
-		p.resSz.Observe(resSz)
+		p.reqSz.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Observe(float64(reqSz))
+		p.resSz.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Observe(resSz)
 	}
 }
 
